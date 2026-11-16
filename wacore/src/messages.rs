@@ -1398,6 +1398,15 @@ impl<'a> MessageAttrs<'a> {
 /// This is a pure function that extracts message metadata from a node's
 /// attributes. It requires the own JID and optional LID to determine
 /// `is_from_me`.
+/// The chat of a one-to-one message: the person, without the device, in the
+/// family the account is addressed by. A hosted (Cloud API) device writes from
+/// `@hosted` or `@hosted.lid`, while the conversation is the account's own
+/// `@s.whatsapp.net` or `@lid` one, as whatsmeow and Baileys file it. The
+/// sender keeps the hosted address, which its Signal session is kept under.
+fn account_chat(jid: &wacore_binary::Jid) -> wacore_binary::Jid {
+    jid.to_non_ad().with_device_hosting(0, false)
+}
+
 pub fn parse_message_info(
     node: &wacore_binary::NodeRef<'_>,
     own_jid: &wacore_binary::Jid,
@@ -1421,6 +1430,26 @@ pub fn parse_message_info(
         .optional_string(MessageAttr::AddressingMode)
         .and_then(|s| AddressingMode::try_from(s.as_ref()).ok());
     let peer_recipient_pn = attrs.optional_jid(MessageAttr::PeerRecipientPn);
+
+    // The addresses of a hosted (Cloud API) sender as the stanza spelled them,
+    // before the chat is folded into the account's family below.
+    if from.is_hosted() && log::log_enabled!(log::Level::Debug) {
+        let spelled = |attr| {
+            attrs
+                .get(attr)
+                .and_then(|value| value.to_jid())
+                .map_or_else(|| "-".to_owned(), |jid| jid.observe().to_string())
+        };
+        log::debug!(
+            "hosted message stanza {}: from={} sender_pn={} sender_lid={} recipient={} peer_recipient_pn={}",
+            wacore_binary::diagnostics::ObservedId::new(&id),
+            from.observe(),
+            spelled(MessageAttr::SenderPn),
+            spelled(MessageAttr::SenderLid),
+            spelled(MessageAttr::Recipient),
+            spelled(MessageAttr::PeerRecipientPn),
+        );
+    }
 
     let mut source = if from.server == Server::Broadcast {
         let participant = attrs.required_jid(MessageAttr::Participant)?;
@@ -1478,14 +1507,11 @@ pub fn parse_message_info(
             .and(peer_recipient_pn.as_ref())
             .filter(|jid| jid.server.is_pn_family() && !jid.user.is_empty())
             .cloned();
-        let chat = recipient
-            .as_ref()
-            .map(|r| r.to_non_ad())
-            .unwrap_or_else(|| from.to_non_ad());
+        let chat = account_chat(recipient.as_ref().unwrap_or(&from));
         // Populate sender_alt so LID-PN cache warms from self-messages
-        let sender_alt = if from.server == Server::Lid {
+        let sender_alt = if from.server.is_lid_family() {
             Some(own_jid.clone())
-        } else if from.server == Server::Pn && own_lid.is_some() {
+        } else if from.server.is_pn_family() && own_lid.is_some() {
             own_lid.cloned()
         } else {
             None
@@ -1500,14 +1526,14 @@ pub fn parse_message_info(
             ..Default::default()
         }
     } else {
-        let sender_alt = if from.server == Server::Lid {
+        let sender_alt = if from.server.is_lid_family() {
             attrs.optional_jid(MessageAttr::SenderPn)
         } else {
             attrs.optional_jid(MessageAttr::SenderLid)
         };
 
         MessageSource {
-            chat: from.to_non_ad(),
+            chat: account_chat(&from),
             sender: from.clone(),
             is_from_me: false,
             sender_alt,
@@ -1980,13 +2006,99 @@ mod parse_message_info_tests {
                 "{from} {recipient:?} {alternate:?}"
             );
             if expected {
+                // A hosted recipient is filed under the account's own family.
                 assert_eq!(
                     info.source.chat,
-                    recipient.unwrap().parse::<Jid>().unwrap().to_non_ad()
+                    recipient
+                        .unwrap()
+                        .replace("@hosted.lid", "@lid")
+                        .parse::<Jid>()
+                        .unwrap()
                 );
                 assert_eq!(info.source.sender, from.parse::<Jid>().unwrap());
                 assert_eq!(info.source.recipient_alt, info.peer_recipient_pn);
             }
+        }
+    }
+
+    /// A hosted (Cloud API) device's message is filed under the account's
+    /// `@lid` or `@s.whatsapp.net` chat, keeps the hosted sender its session
+    /// lives under, and takes the alternate of the other family, if any.
+    #[test]
+    fn hosted_sender_is_filed_under_the_account_family() {
+        let own_pn = Jid::pn("15550000001");
+        let own_lid = Jid::lid("100000000000001");
+        for (from, recipient, sender_pn, sender_lid, chat, sender_alt, from_me) in [
+            (
+                "100000000000009:99@hosted.lid",
+                None,
+                Some("15550000009@s.whatsapp.net"),
+                None,
+                "100000000000009@lid",
+                Some("15550000009@s.whatsapp.net"),
+                false,
+            ),
+            (
+                "100000000000009:99@hosted.lid",
+                None,
+                None,
+                None,
+                "100000000000009@lid",
+                None,
+                false,
+            ),
+            (
+                "15550000009:99@hosted",
+                None,
+                Some("15550000009@s.whatsapp.net"),
+                Some("100000000000009@lid"),
+                "15550000009@s.whatsapp.net",
+                Some("100000000000009@lid"),
+                false,
+            ),
+            // Our own Cloud API device, writing to someone and to no one.
+            (
+                "100000000000001:99@hosted.lid",
+                Some("100000000000009@lid"),
+                None,
+                None,
+                "100000000000009@lid",
+                Some("15550000001@s.whatsapp.net"),
+                true,
+            ),
+            (
+                "15550000001:99@hosted",
+                None,
+                None,
+                None,
+                "15550000001@s.whatsapp.net",
+                Some("100000000000001@lid"),
+                true,
+            ),
+        ] {
+            let mut node = NodeBuilder::new("message")
+                .attr("id", "HOSTED-SENDER")
+                .attr("from", from)
+                .attr("t", "1700000000");
+            for (name, value) in [
+                ("recipient", recipient),
+                ("sender_pn", sender_pn),
+                ("sender_lid", sender_lid),
+            ] {
+                if let Some(value) = value {
+                    node = node.attr(name, value);
+                }
+            }
+            let node = node.build();
+            let info = parse_message_info(&node.as_node_ref(), &own_pn, Some(&own_lid)).unwrap();
+            assert_eq!(info.source.chat, chat.parse::<Jid>().unwrap(), "{from}");
+            assert_eq!(info.source.sender, from.parse::<Jid>().unwrap(), "{from}");
+            assert_eq!(
+                info.source.sender_alt,
+                sender_alt.map(|jid| jid.parse::<Jid>().unwrap()),
+                "{from} {sender_pn:?}"
+            );
+            assert_eq!(info.source.is_from_me, from_me, "{from}");
         }
     }
 
