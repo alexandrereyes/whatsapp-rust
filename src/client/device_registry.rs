@@ -535,8 +535,11 @@ impl Client {
     }
 
     /// The DM memo's recompute body: all known recipient devices plus our own
-    /// companions. WAWebSendUserMsgJob reads the local device table only on
-    /// the send path; WAWebDBDeviceListFanout excludes hosted devices.
+    /// companions, hosted (Cloud API) devices included. WAWebSendUserMsgJob
+    /// reads the local device table only on the send path; WA Web keeps hosted
+    /// devices in a one-to-one fan-out (`includeInFanout = !isHosted ||
+    /// isOneToOneChat`), and without them a Coexistence number's Cloud API
+    /// only receives an "unavailable" placeholder.
     ///
     /// The second return value is whether this is a COMPLETE resolution, i.e.
     /// every registry lookup it needed answered. A partial one is degraded
@@ -594,18 +597,13 @@ impl Client {
 
         let complete = recipient_cached.is_some() && (own_lookup_skipped || own_cached.is_some());
 
-        // Build device list, filter hosted in-place, reuse Vecs
         let mut all_dm_jids = match recipient_cached {
-            Some(mut devices) => {
-                devices.retain(|j| !j.is_hosted());
-                devices
-            }
+            Some(devices) => devices,
             // No record at all, so use the bare JID and let the server fan out
             None => vec![recipient_bare.clone()],
         };
 
         if let Some(mut own_devices) = own_cached {
-            own_devices.retain(|j| !j.is_hosted());
             all_dm_jids.append(&mut own_devices);
         }
 
@@ -618,16 +616,20 @@ impl Client {
         });
 
         // own_cached is keyed by the bot's PN, so own devices come back
-        // PN-addressed. The server rejects a stanza that mixes PN and LID
+        // PN-addressed (`@s.whatsapp.net`, or `@hosted` for our Cloud API
+        // device). The server rejects a stanza that mixes PN and LID
         // participants, so align own devices to LID for a LID recipient
-        // (whatsmeow switches ownID to LID before fanout).
+        // (whatsmeow switches ownID to LID before fanout), keeping a hosted
+        // device hosted.
         if recipient_bare.is_lid() {
             let lid = own_lid.ok_or_else(|| {
                 anyhow::anyhow!("Cannot send a LID-addressed DM before the device LID is known")
             })?;
             for j in all_dm_jids.iter_mut() {
-                if j.is_pn() && j.is_same_user_as(own_jid) {
-                    *j = Jid::lid_device(lid.user.clone(), j.device);
+                let hosted = j.server == Server::Hosted;
+                if (j.is_pn() || hosted) && j.is_same_user_as(own_jid) {
+                    *j = Jid::lid_device(lid.user.clone(), j.device)
+                        .with_device_hosting(j.device, hosted);
                 }
             }
         }
@@ -4701,31 +4703,78 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
     }
 
-    /// Hosted devices stay out of the fan-out (WAWebDBDeviceListFanout), on the
-    /// memoized path exactly as on the cold one.
+    /// Hosted (Cloud API) devices, the recipient's and our own, stay in a
+    /// one-to-one fan-out in the recipient's addressing family: for a LID
+    /// recipient our `@hosted` device becomes `@hosted.lid`, never `@lid`
+    /// nor a PN left among LID participants. Same on the memoized path.
     #[tokio::test]
-    async fn dm_devices_memo_excludes_hosted_devices() {
-        let client = create_test_client().await;
-        setup_hosted_device_record(
-            &client,
-            DM_RECIPIENT_PN,
-            &[(0, false), (2, true), (5, false)],
-        )
-        .await;
-        setup_hosted_device_record(&client, DM_OWN_PN, &[(0, false), (1, false), (3, true)]).await;
-        let recipient = Jid::pn(DM_RECIPIENT_PN);
+    async fn dm_devices_memo_includes_hosted_devices_in_the_recipient_family() {
+        for lid_recipient in [false, true] {
+            let client = create_test_client().await;
+            setup_hosted_device_record(
+                &client,
+                DM_RECIPIENT_PN,
+                &[(0, false), (2, true), (5, false)],
+            )
+            .await;
+            setup_hosted_device_record(&client, DM_OWN_PN, &[(0, false), (1, false), (3, true)])
+                .await;
+            setup_lid_pn(&client, DM_RECIPIENT_LID, DM_RECIPIENT_PN).await;
+            let (recipient, recipient_user, own_user, own_lid, family, hosted_server) =
+                if lid_recipient {
+                    (
+                        Jid::lid(DM_RECIPIENT_LID),
+                        DM_RECIPIENT_LID,
+                        DM_OWN_LID,
+                        Some(dm_own_lid_jid()),
+                        Server::is_lid_family as fn(Server) -> bool,
+                        Server::HostedLid,
+                    )
+                } else {
+                    (
+                        Jid::pn(DM_RECIPIENT_PN),
+                        DM_RECIPIENT_PN,
+                        DM_OWN_PN,
+                        None,
+                        Server::is_pn_family as fn(Server) -> bool,
+                        Server::Hosted,
+                    )
+                };
+            let own = dm_own_jid();
+            let resolve = || {
+                client.resolve_dm_devices_memoized(
+                    &recipient,
+                    &recipient,
+                    &own,
+                    own_lid.as_ref(),
+                    crate::cache::Freshness::CachePreferred,
+                )
+            };
 
-        let first = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
-            .await
-            .expect("first resolve");
-        assert_eq!(device_ids_of(first.devices(), DM_RECIPIENT_PN), vec![0, 5]);
-        assert_eq!(device_ids_of(first.devices(), DM_OWN_PN), vec![0]);
+            let first = resolve().await.expect("first resolve");
+            let devices = first.devices();
+            assert_eq!(device_ids_of(devices, recipient_user), vec![0, 2, 5]);
+            assert_eq!(device_ids_of(devices, own_user), vec![0, 3]);
+            assert_eq!(devices.len(), 5, "lid_recipient={lid_recipient}");
+            assert!(
+                devices.iter().all(|jid| family(jid.server)),
+                "one addressing family per stanza (lid_recipient={lid_recipient})"
+            );
+            for (user, device) in [(recipient_user, 2), (own_user, 3)] {
+                let hosted = devices
+                    .iter()
+                    .find(|jid| jid.user == user && jid.device == device)
+                    .expect("hosted device kept");
+                assert_eq!(
+                    hosted.server, hosted_server,
+                    "lid_recipient={lid_recipient}"
+                );
+            }
 
-        let second = resolve_dm(&client, &recipient, crate::cache::Freshness::CachePreferred)
-            .await
-            .expect("second resolve");
-        assert_eq!(dm_recomputes(&client), 1);
-        assert!(Arc::ptr_eq(&first, &second));
+            let second = resolve().await.expect("second resolve");
+            assert_eq!(dm_recomputes(&client), 1);
+            assert!(Arc::ptr_eq(&first, &second));
+        }
     }
 
     /// The memo is keyed by recipient only, so the sending identity it was built

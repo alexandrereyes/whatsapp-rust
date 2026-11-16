@@ -744,20 +744,21 @@ fn test_large_group_with_mixed_device_availability() {
 ///
 /// # Context: What are HOSTED devices?
 ///
-/// HOSTED devices (Cloud API / Meta Business API) are WhatsApp Business accounts
-/// that use Meta's server-side infrastructure instead of traditional E2EE.
+/// HOSTED devices (Cloud API / Meta Business API) are the device Meta's Cloud
+/// API runs for a WhatsApp Business account, alone or in Coexistence with the
+/// Business app.
 ///
 /// ## Identification:
 /// - Device ID 99 (`:99`) on any server
 /// - Server `@hosted` or `@hosted.lid`
 ///
 /// ## Behavior:
-/// - They do NOT have Signal protocol prekey bundles
-/// - For 1:1 chats: included in device list, but prekey fetch fails gracefully
+/// - They are Signal devices, with prekey bundles certified by a HOSTED ADV identity
+/// - For 1:1 chats: included in the fan-out and encrypted for like any device
 /// - For groups: proactively filtered out before SKDM distribution
 ///
-/// This test verifies that when a hosted device is included in the device list
-/// (which would happen for 1:1 chats), the missing prekey is handled gracefully.
+/// This test covers a hosted device in a 1:1 device list whose bundle the
+/// server did not return: like any device without one, it is skipped.
 #[test]
 fn test_cloud_api_device_without_prekey() {
     let regular_device: Jid = "1234567890:0@s.whatsapp.net"
@@ -788,10 +789,10 @@ fn test_cloud_api_device_without_prekey() {
     );
     assert!(
         resolver.prekey_bundles[&cloud_api].is_none(),
-        "Cloud API device should not have a bundle (they don't use Signal protocol)"
+        "this Cloud API device's bundle is missing from the response"
     );
 
-    println!("✅ Cloud API device has no prekey bundle (expected behavior)");
+    println!("✅ Cloud API device without a returned prekey bundle");
 }
 
 /// Test case: HOSTED devices are filtered from group SKDM distribution
@@ -805,10 +806,8 @@ fn test_cloud_api_device_without_prekey() {
 /// var includeInFanout = !isHosted || isOneToOneChat;
 /// ```
 ///
-/// ## Reasons:
-/// 1. Hosted devices don't use Signal protocol - they can't process SKDM
-/// 2. Including them causes unnecessary prekey fetch failures
-/// 3. Group encryption is handled differently for Cloud API businesses
+/// Hosted devices receive 1:1 messages over pairwise Signal sessions, but
+/// never a group's sender key: WA Web keeps them out of group fan-out.
 ///
 /// This test verifies that `is_hosted()` correctly identifies devices that
 /// should be filtered from group SKDM distribution.

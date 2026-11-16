@@ -426,9 +426,9 @@ async fn hosted_lid_participant_send_and_receive_use_one_account_before_device_l
         let peer = peer.clone();
         let hosted = hosted.clone();
         tokio::spawn(async move {
-            // Normal DM fanout deliberately excludes hosted devices. This
-            // public pairwise builder retains them and uses the production
-            // send lock ordering, real Signal encryption and pre-wire commit.
+            // The public pairwise builder retains hosted devices, as DM
+            // fan-out does, and uses the production send lock ordering, real
+            // Signal encryption and pre-wire commit.
             let message = waproto::whatsapp::Message::text("synthetic hosted lock ordering");
             let (nodes, _) = client
                 .signal()

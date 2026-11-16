@@ -2354,15 +2354,16 @@ mod tests {
     /// # Context: What are HOSTED devices?
     ///
     /// HOSTED devices (also known as Cloud API or Meta Business API devices) are
-    /// WhatsApp Business accounts that use Meta's server-side infrastructure instead
-    /// of traditional end-to-end encryption with Signal protocol.
+    /// the device Meta's Cloud API runs for a WhatsApp Business account, alone or
+    /// next to the Business app's phone (Coexistence).
     ///
     /// ## Key characteristics:
     /// - Device ID is always 99 (`:99`)
     /// - Server is `@hosted` (phone-based) or `@hosted.lid` (LID-based)
-    /// - They do NOT use Signal protocol prekeys
+    /// - They are Signal devices: prekey bundles certified by a HOSTED ADV
+    ///   identity, sessions kept under their hosted address
     /// - They should be EXCLUDED from group message fanout
-    /// - They CAN receive 1:1 messages (but prekey fetch will fail, causing graceful skip)
+    /// - They are INCLUDED in 1:1 message fanout
     ///
     /// ## Why exclude from groups?
     /// WhatsApp Web explicitly filters hosted devices from group SKDM (Sender Key
@@ -2546,10 +2547,9 @@ mod tests {
     ///
     /// # Why this matters:
     /// When sending a group message, we distribute Sender Key Distribution Messages
-    /// (SKDM) to all participant devices. However, HOSTED devices:
-    /// 1. Don't use Signal protocol, so they can't process SKDM
-    /// 2. WhatsApp Web explicitly excludes them from group fanout
-    /// 3. Including them would cause unnecessary prekey fetch failures
+    /// (SKDM) to all participant devices. HOSTED devices are left out: WhatsApp
+    /// Web excludes them from group fanout, although they receive 1:1 messages
+    /// over pairwise Signal sessions.
     ///
     /// This test documents the expected behavior when filtering device lists.
     #[test]
