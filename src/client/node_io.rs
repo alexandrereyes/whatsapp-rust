@@ -1717,6 +1717,25 @@ impl Client {
                 debug!("Skipping passive tasks: connection closed");
                 return;
             }
+            // A profile that logs in passive stays passive: the active IQ is what
+            // makes the server deliver the offline backlog, and a connection that
+            // lives for one send wants none of it. Nothing is drained, so the drain
+            // is reported over at once (the send path waits for it), and the
+            // pre-key, presence and background queries are left to the next
+            // connection that goes active.
+            if client_clone
+                .persistence_manager
+                .get_device_snapshot()
+                .client_profile
+                .passive_login
+            {
+                debug!("Passive login: staying passive, skipping the active IQ and the startup tasks");
+                client_clone.complete_offline_sync(0).await;
+                client_clone.wait_for_offline_delivery_end().await;
+                check_generation!();
+                client_clone.dispatch_connected(task_generation).await;
+                return;
+            }
             // WA Web PassiveTasks: the pre-key upload is a passive task, not a gate
             // on going active — it only publishes keys for peers' FUTURE sessions
             // (the offline backlog uses keys we already hold, and a fresh device's
